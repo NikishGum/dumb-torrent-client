@@ -4,22 +4,29 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
+	"dumb-tor-client/internal/handshake"
 	"dumb-tor-client/internal/peers"
 
 	bencode "github.com/jackpal/bencode-go"
+	litter "github.com/sanity-io/litter"
 )
 
 const (
 	Port uint16 = 6881
 )
+
+var pid [20]byte
 
 type TorrentFile struct {
 	Announce  string
@@ -49,10 +56,19 @@ func Open(r io.Reader) (*TorrentFile, error) {
 		return nil, err
 	}
 
+	var peerId [20]byte
+	_, err = rand.Read(peerId[:])
+	if err != nil {
+		return nil, err
+	}
+	pid = peerId
+
 	torFile, err := bto.toTorrentFile()
 	if err != nil {
 		return nil, err
 	}
+
+	fmt.Printf("Startring work on downloading file \"%s\"\n", torFile.Name)
 
 	return &torFile, nil
 }
@@ -62,6 +78,10 @@ func (b *bencodeTorrent) toTorrentFile() (TorrentFile, error) {
 	newTF := TorrentFile{}
 	var err error
 
+	if len(b.Announce) == 0 {
+		err := errors.New("Announce link not found. Torrent not supported.")
+		return TorrentFile{}, err
+	}
 	newTF.Announce = b.Announce
 
 	newTF.InfoHash, err = b.Info.getHashInfo()
@@ -111,16 +131,17 @@ func (i *bencodeInfo) getHashPieces() ([][20]byte, error) {
 	return hashes, nil
 }
 
+// TODO:
+// Calculate piece length
+
 // Function build's tracker url with specific params, that used for GET request
-// peerID - a unique username that identifies the user
+// peerID - a unique peername for created peer
 // port - by standart 6881
 func (t *TorrentFile) buildTrackerURL(peerID [20]byte, port uint16) (string, error) {
 	base, err := url.Parse(t.Announce)
 	if err != nil {
 		return "", err
 	}
-
-	log.Printf("%x sized %d", t.InfoHash, len(t.InfoHash))
 
 	params := url.Values{
 		"info_hash":  []string{string(t.InfoHash[:])},
@@ -138,23 +159,17 @@ func (t *TorrentFile) buildTrackerURL(peerID [20]byte, port uint16) (string, err
 
 // Function to get peers IP's and ports for onward downloading
 func (t *TorrentFile) getPeers() ([]peers.Peer, error) {
-	// Generate random peerid
-	var peerid [20]byte
-	_, err := rand.Read(peerid[:])
-	if err != nil {
-		return nil, err
-	}
-
-	url, err := t.buildTrackerURL(peerid, Port)
+	// Generate random peerId
+	url, err := t.buildTrackerURL(pid, Port)
 
 	// GET request
-	resp, err := http.Get(url)
+	responce, err := http.Get(url)
 	if err != nil {
 		return nil, err
 	}
 
 	// Read body
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(responce.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -164,11 +179,9 @@ func (t *TorrentFile) getPeers() ([]peers.Peer, error) {
 	// Peers - long binary blob, that contains IP adress of each peer
 	bencoded_resp := string(body)
 
-	log.Println(bencoded_resp)
 	presp := peers.PeerResponce{}
 
 	err = bencode.Unmarshal(strings.NewReader(bencoded_resp), &presp)
-	log.Println("Written in struct: ", presp.PeersBin)
 	if err != nil {
 		return nil, err
 	}
@@ -179,6 +192,67 @@ func (t *TorrentFile) getPeers() ([]peers.Peer, error) {
 		return nil, err
 	}
 
-	log.Println("Function should be closed here")
 	return p_arr, nil
+}
+
+func (t *TorrentFile) completeHandshake(connection net.Conn) (bool, error) {
+	litter.Config.Compact = true
+	hshake := handshake.Handshake{
+		InfoHash: t.InfoHash,
+		PeerId:   pid,
+		Pstr:     "BitTorrent protocol",
+	}
+
+	buf := hshake.Serialize()
+
+	log.Println("Handshake:\n ", litter.Sdump(hshake))
+	log.Println("Sending: ", buf)
+
+	n, err := connection.Write(buf)
+	if err != nil {
+		return false, err
+	}
+	log.Printf("Written %d bytes to peer.", n)
+
+	responce, err := handshake.Read(connection)
+	if err != nil {
+		return false, err
+	}
+
+	log.Println("Got responce hshake:\n ", litter.Sdump(responce))
+
+	if responce.InfoHash != hshake.InfoHash {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (t *TorrentFile) StartDownload() error {
+	// Start TCP connection with peer
+	// conn, err := net.DialTimeout("tcp", peer.String(), 3 * time.Second)
+	// Complete Two-way BitTorrent handshake
+	// Exchange messages to download pieces
+	peers, err := t.getPeers()
+	if err != nil {
+		return err
+	}
+
+	rand_peer := peers[0]
+	log.Println("Trying peer ", rand_peer.String())
+
+	conn, err := net.DialTimeout("tcp", rand_peer.String(), 3*time.Second)
+	if err != nil {
+		return fmt.Errorf("dial %s: %w", conn, err)
+	}
+	defer conn.Close()
+
+	log.Println("Connected to: ", rand_peer.String())
+
+	if completed, err := t.completeHandshake(conn); err != nil || !completed {
+		return fmt.Errorf("handshake. completed: %t, err: %w", completed, err)
+	}
+	log.Printf("Two-way handshake completed for %s", rand_peer)
+
+	return nil
 }

@@ -55,3 +55,7 @@ func Unmarshal(peersBin []byte) ([]Peer, error) {
 
 	return peers, nil
 }
+
+func (p Peer) String() string {
+	return p.IP.String() + ":" + fmt.Sprintf("%d", p.Port)
+}

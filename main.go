@@ -3,8 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
-	//"encoding/binary"
-	//"fmt"
+
 	"dumb-tor-client/internal/torrentfile"
 )
 
@@ -19,8 +18,14 @@ func main() {
 
 	tfile, err := torrentfile.Open(fp)
 	if err != nil {
-		panic(err)
+		// Probably not the best error handling practice
+		fmt.Println("Got error: ", err)
+		return
 	}
 
-	fmt.Println(tfile.GetPeers())
+	err = tfile.StartDownload()
+	if err != nil {
+		fmt.Println("Got error: ", err)
+		return
+	}
 }
