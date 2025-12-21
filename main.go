@@ -8,7 +8,9 @@ import (
 )
 
 func main() {
-	fp, err := os.Open("debian-13.1.0-amd64-netinst.iso.torrent")
+	args := os.Args[1:]
+
+	fp, err := os.Open(args[0])
 	if err != nil {
 		panic(err)
 	}
@@ -23,7 +25,7 @@ func main() {
 		return
 	}
 
-	err = tfile.StartDownload()
+	err = tfile.StartDownload(args[1])
 	if err != nil {
 		fmt.Println("Got error: ", err)
 		return

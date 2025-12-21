@@ -2,7 +2,10 @@ package message
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
+	"log"
 )
 
 type messageID uint8
@@ -45,10 +48,40 @@ func (m *Message) Serialize() []byte {
 	return buf
 }
 
+// TODO: Error handling here
+func ParseHave(msg Message) (int, error) {
+	index := binary.BigEndian.Uint32(msg.Payload)
+	return int(index), nil
+}
+
+func ParsePiece(expectedIndex int, buf []byte, msg Message) (int, error) {
+	if msg.ID != MsgPiece {
+		return 0, fmt.Errorf("expected PIECE (id 7), got %d", msg.ID)
+	}
+	if len(msg.Payload) < 8 {
+		return 0, errors.New("piece message too short")
+	}
+
+	index := int(binary.BigEndian.Uint32(msg.Payload[0:4]))
+	begin := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+	block := msg.Payload[8:]
+
+	if index != expectedIndex {
+		return 0, fmt.Errorf("unexpected piece index %d (want %d)", index, expectedIndex)
+	}
+	if begin+len(block) > len(buf) {
+		return 0, fmt.Errorf("block [%d:%d] overflows piece buffer", begin, begin+len(block))
+	}
+
+	copy(buf[begin:], block)
+	return len(block), nil
+}
+
 func Read(r io.Reader) (*Message, error) {
 	lengthBuf := make([]byte, 4)
 	_, err := io.ReadFull(r, lengthBuf)
 	if err != nil {
+		log.Println("Error reading buffer")
 		return nil, err
 	}
 	length := binary.BigEndian.Uint32(lengthBuf)

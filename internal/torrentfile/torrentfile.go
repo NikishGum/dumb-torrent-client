@@ -8,25 +8,39 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
-	"dumb-tor-client/internal/handshake"
+	"dumb-tor-client/internal/client"
+	"dumb-tor-client/internal/message"
 	"dumb-tor-client/internal/peers"
 
 	bencode "github.com/jackpal/bencode-go"
-	litter "github.com/sanity-io/litter"
 )
 
 const (
-	Port uint16 = 6881
+	Port         uint16 = 6881
+	MaxBacklog          = 5
+	MaxBlockSize        = 16384
 )
 
-var pid [20]byte
+var counter int = 0
+
+type pieceWork struct {
+	index       int
+	pieceHash   [20]byte
+	pieceLength int
+}
+
+type pieceResult struct {
+	index int
+	buf   []byte
+}
 
 type TorrentFile struct {
 	Announce  string
@@ -35,6 +49,7 @@ type TorrentFile struct {
 	PieceLen  int
 	Length    int
 	Name      string
+	PeerID    [20]byte
 }
 
 type bencodeInfo struct {
@@ -49,6 +64,40 @@ type bencodeTorrent struct {
 	Info     bencodeInfo `bencode:"info"`
 }
 
+type pieceProgress struct {
+	index      int
+	client     *client.Client
+	buf        []byte
+	downloaded int
+	requested  int
+	backlog    int
+}
+
+func (state *pieceProgress) readMessage() error {
+	msg, err := state.client.Read()
+	if err != nil {
+		return err
+	}
+
+	switch msg.ID {
+	case message.MsgHave:
+		index, err := message.ParseHave(*msg)
+		if err != nil {
+			return err
+		}
+		state.client.Bitfield.SetPiece(index)
+	case message.MsgPiece:
+		n, err := message.ParsePiece(state.index, state.buf, *msg)
+		if err != nil {
+			return err
+		}
+		state.downloaded += n
+		state.backlog--
+	}
+
+	return nil
+}
+
 func Open(r io.Reader) (*TorrentFile, error) {
 	bto := bencodeTorrent{}
 	err := bencode.Unmarshal(r, &bto)
@@ -56,19 +105,12 @@ func Open(r io.Reader) (*TorrentFile, error) {
 		return nil, err
 	}
 
-	var peerId [20]byte
-	_, err = rand.Read(peerId[:])
-	if err != nil {
-		return nil, err
-	}
-	pid = peerId
-
 	torFile, err := bto.toTorrentFile()
 	if err != nil {
 		return nil, err
 	}
 
-	fmt.Printf("Startring work on downloading file \"%s\"\n", torFile.Name)
+	fmt.Printf("Starting work on downloading file \"%s\"\n", torFile.Name)
 
 	return &torFile, nil
 }
@@ -92,6 +134,13 @@ func (b *bencodeTorrent) toTorrentFile() (TorrentFile, error) {
 	if err != nil {
 		return TorrentFile{}, err
 	}
+
+	var peerId [20]byte
+	_, err = rand.Read(peerId[:])
+	if err != nil {
+		return TorrentFile{}, err
+	}
+	newTF.PeerID = peerId
 
 	newTF.PieceLen = b.Info.PieceLen
 	newTF.Length = b.Info.Len
@@ -131,9 +180,6 @@ func (i *bencodeInfo) getHashPieces() ([][20]byte, error) {
 	return hashes, nil
 }
 
-// TODO:
-// Calculate piece length
-
 // Function build's tracker url with specific params, that used for GET request
 // peerID - a unique peername for created peer
 // port - by standart 6881
@@ -160,7 +206,7 @@ func (t *TorrentFile) buildTrackerURL(peerID [20]byte, port uint16) (string, err
 // Function to get peers IP's and ports for onward downloading
 func (t *TorrentFile) getPeers() ([]peers.Peer, error) {
 	// Generate random peerId
-	url, err := t.buildTrackerURL(pid, Port)
+	url, err := t.buildTrackerURL(t.PeerID, Port)
 
 	// GET request
 	responce, err := http.Get(url)
@@ -195,64 +241,175 @@ func (t *TorrentFile) getPeers() ([]peers.Peer, error) {
 	return p_arr, nil
 }
 
-func (t *TorrentFile) completeHandshake(connection net.Conn) (bool, error) {
-	litter.Config.Compact = true
-	hshake := handshake.Handshake{
-		InfoHash: t.InfoHash,
-		PeerId:   pid,
-		Pstr:     "BitTorrent protocol",
+func (t TorrentFile) calcuateBound(index int) (int, int) {
+	left := index * t.PieceLen
+	right := left + t.PieceLen
+
+	if right > t.Length {
+		right = t.Length
 	}
 
-	buf := hshake.Serialize()
-
-	log.Println("Handshake:\n ", litter.Sdump(hshake))
-	log.Println("Sending: ", buf)
-
-	n, err := connection.Write(buf)
-	if err != nil {
-		return false, err
-	}
-	log.Printf("Written %d bytes to peer.", n)
-
-	responce, err := handshake.Read(connection)
-	if err != nil {
-		return false, err
-	}
-
-	log.Println("Got responce hshake:\n ", litter.Sdump(responce))
-
-	if responce.InfoHash != hshake.InfoHash {
-		return false, nil
-	}
-
-	return true, nil
+	return left, right
 }
 
-func (t *TorrentFile) StartDownload() error {
-	// Start TCP connection with peer
-	// conn, err := net.DialTimeout("tcp", peer.String(), 3 * time.Second)
-	// Complete Two-way BitTorrent handshake
-	// Exchange messages to download pieces
+func (t TorrentFile) calculatePieceSize(index int) int {
+	left := index * t.PieceLen
+	right := left + t.PieceLen
+
+	if right > t.Length {
+		right = t.Length
+	}
+
+	return right - left
+}
+
+func (t TorrentFile) checkIntegrity(pw *pieceWork, buf []byte) error {
+	hash := sha1.Sum(buf)
+
+	if !bytes.Equal(hash[:], pw.pieceHash[:]) {
+		return fmt.Errorf("Index %d failed integrity check", pw.index)
+	}
+	return nil
+}
+
+func (t *TorrentFile) attemptDownloadPiece(c *client.Client, pw *pieceWork) ([]byte, error) {
+	state := pieceProgress{
+		index:  pw.index,
+		client: c,
+		buf:    make([]byte, pw.pieceLength),
+	}
+
+	c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+	defer c.Conn.SetDeadline(time.Time{})
+
+	for state.downloaded < pw.pieceLength {
+		if !state.client.Chocked {
+			for state.backlog < MaxBacklog && state.requested < pw.pieceLength {
+				blockSize := MaxBlockSize
+
+				if pw.pieceLength-state.requested < blockSize {
+					blockSize = pw.pieceLength - state.requested
+				}
+
+				err := c.SendRequest(pw.index, state.requested, blockSize)
+				if err != nil {
+					return nil, err
+				}
+				state.backlog++
+				state.requested += blockSize
+			}
+		}
+
+		err := state.readMessage()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return state.buf, nil
+}
+
+func (t *TorrentFile) startDownloadWork(peer peers.Peer, workQueue chan *pieceWork, results chan *pieceResult) {
+	c, err := client.New(peer, t.PeerID, t.InfoHash)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	defer c.CloseClient()
+
+	log.Printf("Completed handshake with %s", peer.String())
+
+	c.SendUnchoke()
+	c.SendInterested()
+
+	for pw := range workQueue {
+		if !c.Bitfield.HasPiece(pw.index) {
+			workQueue <- pw
+			continue
+		}
+
+		// Download the piece
+		buf, err := t.attemptDownloadPiece(c, pw)
+		if err != nil {
+			log.Println("Exiting", err)
+			workQueue <- pw
+			return
+		}
+
+		// checkIntegrity
+		err = t.checkIntegrity(pw, buf)
+		if err != nil {
+			log.Println("Exiting", err)
+			workQueue <- pw
+			continue
+		}
+		// SendHave
+		c.SendHave(pw.index)
+		// Place in results
+		results <- &pieceResult{pw.index, buf}
+	}
+}
+
+func (t *TorrentFile) VerifyHash(buf []byte) error {
+	hash := sha1.Sum(buf)
+
+	if !bytes.Equal(hash[:], t.InfoHash[:]) {
+		return fmt.Errorf("Failed integrity check")
+	}
+
+	return nil
+}
+
+func (t *TorrentFile) StartDownload(filename string) error {
+	if filename == "" {
+		filename = t.Name
+	}
+
 	peers, err := t.getPeers()
 	if err != nil {
 		return err
 	}
+	log.Println("Sized: ", t.Length)
+	log.Println("Piece size: ", t.PieceLen)
+	log.Println("Number of pieces: ", len(t.PieceHash))
+	log.Println("For comparison: ", float32(t.Length)/float32(t.PieceLen))
 
-	rand_peer := peers[0]
-	log.Println("Trying peer ", rand_peer.String())
+	workQueue := make(chan *pieceWork, len(t.PieceHash))
+	results := make(chan *pieceResult)
 
-	conn, err := net.DialTimeout("tcp", rand_peer.String(), 3*time.Second)
+	for index, hash := range t.PieceHash {
+		length := t.calculatePieceSize(index)
+		workQueue <- &pieceWork{index, hash, length}
+	}
+
+	for _, peer := range peers {
+		go t.startDownloadWork(peer, workQueue, results)
+	}
+
+	buf := make([]byte, t.Length)
+	donePieces := 0
+	for donePieces < len(t.PieceHash) {
+		res := <-results
+		begin, end := t.calcuateBound(res.index)
+		copy(buf[begin:end], res.buf)
+		donePieces++
+
+		percent := float64(donePieces) / float64(len(t.PieceHash)) * 100
+		numWorkers := runtime.NumGoroutine() - 1 // subtract 1 for main thread
+		log.Printf("[%0.2f%%] Downloaded piece #%d from %d peers\n", percent, res.index, numWorkers)
+	}
+	close(workQueue)
+
+	// Dump buffer to file
+	err = t.VerifyHash(buf)
 	if err != nil {
-		return fmt.Errorf("dial %s: %w", conn, err)
+		return err
 	}
-	defer conn.Close()
 
-	log.Println("Connected to: ", rand_peer.String())
-
-	if completed, err := t.completeHandshake(conn); err != nil || !completed {
-		return fmt.Errorf("handshake. completed: %t, err: %w", completed, err)
+	err = os.WriteFile("results/"+filename, buf, 0o644)
+	if err != nil {
+		return err
 	}
-	log.Printf("Two-way handshake completed for %s", rand_peer)
 
 	return nil
 }

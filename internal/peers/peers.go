@@ -23,8 +23,6 @@ func Unmarshal(peersBin []byte) ([]Peer, error) {
 
 	// IP and port len
 
-	log.Printf("got peerBin sized %d", len(peersBin))
-
 	lenPeer := 6
 
 	peers := []Peer{}
@@ -40,12 +38,9 @@ func Unmarshal(peersBin []byte) ([]Peer, error) {
 	for i := 0; i < numPeers; i += 1 {
 		offset := i * lenPeer
 
-		log.Printf("Iteration #%d", i)
 		peer_ip := net.IPv4(peersBin[offset], peersBin[offset+1], peersBin[offset+2], peersBin[offset+3])
-		log.Println("Got ip: ", peer_ip)
 
 		peer_port := binary.BigEndian.Uint16(peersBin[offset+4 : offset+6])
-		log.Println("Got port: ", peer_port)
 
 		peers = append(peers, Peer{
 			IP:   peer_ip,
